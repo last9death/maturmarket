@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+
 from html.parser import HTMLParser
 from typing import Iterable, Optional
 from urllib.parse import urljoin
 from xml.etree import ElementTree
+
+from typing import Iterable, Optional
+from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup
+
 
 from maturmarket_bot.models import AvailabilityStatus, Product, ProductSignals, SearchResult
 
@@ -72,6 +79,7 @@ SEARCH_PRICE_SELECTORS = [
 SEARCH_IMAGE_SELECTORS = [
     "img",
 ]
+
 
 @dataclass
 class HtmlNode:
@@ -165,6 +173,24 @@ def _text_from_selectors(root: HtmlNode, selectors: Iterable[str]) -> tuple[Opti
             text = node.text(strip=True)
             if text:
                 return text, [selector]
+=======
+SITEMAP_LOC_SELECTORS = [
+    "loc",
+]
+
+
+@dataclass
+class ParseResult:
+    product: Product
+    html: str
+
+
+def _text_from_selectors(soup: BeautifulSoup, selectors: Iterable[str]) -> tuple[Optional[str], list[str]]:
+    for selector in selectors:
+        node = soup.select_one(selector)
+        if node and node.get_text(strip=True):
+            return node.get_text(strip=True), [selector]
+
     return None, []
 
 
@@ -203,6 +229,7 @@ def _resolve_url(base_url: str, href: Optional[str]) -> Optional[str]:
 
 
 def parse_product(html: str, url: str, checked_at: Optional[datetime] = None) -> Product:
+
     root = _parse_html(html)
     signals = ProductSignals()
 
@@ -215,11 +242,25 @@ def parse_product(html: str, url: str, checked_at: Optional[datetime] = None) ->
     price_current = _extract_price(price_text)
 
     old_price_text, selectors = _text_from_selectors(root, OLD_PRICE_SELECTORS)
+
+    soup = BeautifulSoup(html, "html.parser")
+    signals = ProductSignals()
+
+    title, selectors = _text_from_selectors(soup, TITLE_SELECTORS)
+    signals.selectors_used.extend(selectors)
+    title = title or ""
+
+    price_text, selectors = _text_from_selectors(soup, PRICE_SELECTORS)
+    signals.selectors_used.extend(selectors)
+    price_current = _extract_price(price_text)
+
+    old_price_text, selectors = _text_from_selectors(soup, OLD_PRICE_SELECTORS)
     signals.selectors_used.extend(selectors)
     price_old = _extract_price(old_price_text)
 
     image_url = None
     for selector in IMAGE_SELECTORS:
+
         node = _select_one(root, selector)
         if node and node.attrs.get("src"):
             image_url = _resolve_url(url, node.attrs.get("src"))
@@ -227,17 +268,34 @@ def parse_product(html: str, url: str, checked_at: Optional[datetime] = None) ->
             break
 
     body_text = root.text(separator=" ", strip=True)
+
+        node = soup.select_one(selector)
+        if node and node.get("src"):
+            image_url = _resolve_url(url, node.get("src"))
+            signals.selectors_used.append(selector)
+            break
+
+    body_text = soup.get_text(separator=" ", strip=True)
+
     signals.in_stock_hits = _has_keyword(body_text, IN_STOCK_KEYWORDS)
     signals.out_of_stock_hits = _has_keyword(body_text, OUT_OF_STOCK_KEYWORDS)
     signals.preorder_hits = _has_keyword(body_text, PREORDER_KEYWORDS)
 
     for selector in BUY_BUTTON_SELECTORS:
+
         button = _select_one(root, selector)
         if button:
             signals.buy_button_found = True
             signals.selectors_used.append(selector)
             classes = button.attrs.get("class", "").split()
             if "disabled" in button.attrs or "disabled" in classes:
+
+        button = soup.select_one(selector)
+        if button:
+            signals.buy_button_found = True
+            signals.selectors_used.append(selector)
+            if button.has_attr("disabled") or "disabled" in button.get("class", []):
+
                 signals.buy_button_disabled = True
             break
 

@@ -1,10 +1,20 @@
 from datetime import datetime
 
+
 from maturmarket_bot.models import AvailabilityStatus
 from maturmarket_bot.parser import parse_product, parse_sitemap_urls
 
 
 def test_parse_sitemap_urls_handles_index_and_urlset() -> None:
+import pytest
+
+from maturmarket_bot.models import AvailabilityStatus
+
+
+def test_parse_sitemap_urls_handles_index_and_urlset() -> None:
+    pytest.importorskip("bs4")
+    from maturmarket_bot.parser import parse_sitemap_urls
+
     xml = """
     <sitemapindex>
       <sitemap><loc>https://example.com/sitemap-products.xml</loc></sitemap>
@@ -19,6 +29,10 @@ def test_parse_sitemap_urls_handles_index_and_urlset() -> None:
 
 
 def test_parse_product_out_of_stock_keyword_wins() -> None:
+
+    pytest.importorskip("bs4")
+    from maturmarket_bot.parser import parse_product
+
     html = """
     <html>
       <body>
