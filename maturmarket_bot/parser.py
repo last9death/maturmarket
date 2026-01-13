@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+
+from html.parser import HTMLParser
+from typing import Iterable, Optional
+from urllib.parse import urljoin
+from xml.etree import ElementTree
+
 from typing import Iterable, Optional
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
+
 
 from maturmarket_bot.models import AvailabilityStatus, Product, ProductSignals, SearchResult
 
@@ -73,6 +80,100 @@ SEARCH_IMAGE_SELECTORS = [
     "img",
 ]
 
+
+@dataclass
+class HtmlNode:
+    tag: str
+    attrs: dict[str, str]
+    children: list["HtmlNode"]
+    text_parts: list[str]
+
+    def text(self, separator: str = " ", strip: bool = True) -> str:
+        chunks: list[str] = []
+        if self.text_parts:
+            chunks.append(" ".join(self.text_parts))
+        for child in self.children:
+            child_text = child.text(separator=separator, strip=strip)
+            if child_text:
+                chunks.append(child_text)
+        combined = separator.join(chunk for chunk in chunks if chunk)
+        return combined.strip() if strip else combined
+
+
+class MiniHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.root = HtmlNode(tag="document", attrs={}, children=[], text_parts=[])
+        self.stack = [self.root]
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        attr_map = {key: value or "" for key, value in attrs}
+        node = HtmlNode(tag=tag, attrs=attr_map, children=[], text_parts=[])
+        self.stack[-1].children.append(node)
+        self.stack.append(node)
+
+    def handle_endtag(self, tag: str) -> None:
+        if len(self.stack) > 1:
+            self.stack.pop()
+
+    def handle_data(self, data: str) -> None:
+        if data.strip():
+            self.stack[-1].text_parts.append(data.strip())
+
+
+def _parse_html(html: str) -> HtmlNode:
+    parser = MiniHTMLParser()
+    parser.feed(html)
+    return parser.root
+
+
+def _match_simple_selector(node: HtmlNode, selector: str) -> bool:
+    if selector.startswith("."):
+        class_name = selector[1:]
+        classes = node.attrs.get("class", "").split()
+        return class_name in classes
+    if "." in selector:
+        tag, class_name = selector.split(".", 1)
+        if node.tag != tag:
+            return False
+        classes = node.attrs.get("class", "").split()
+        return class_name in classes
+    return node.tag == selector
+
+
+def _select_all(root: HtmlNode, selector: str) -> list[HtmlNode]:
+    parts = selector.split()
+
+    def recurse(nodes: list[HtmlNode], part_index: int) -> list[HtmlNode]:
+        if part_index >= len(parts):
+            return nodes
+        part = parts[part_index]
+        matched: list[HtmlNode] = []
+        for node in nodes:
+            for child in node.children:
+                if _match_simple_selector(child, part):
+                    matched.append(child)
+                matched.extend(recurse([child], part_index))
+        if part_index == len(parts) - 1:
+            return matched
+        return recurse(matched, part_index + 1)
+
+    return recurse([root], 0)
+
+
+def _select_one(root: HtmlNode, selector: str) -> Optional[HtmlNode]:
+    matches = _select_all(root, selector)
+    return matches[0] if matches else None
+
+
+def _text_from_selectors(root: HtmlNode, selectors: Iterable[str]) -> tuple[Optional[str], list[str]]:
+    for selector in selectors:
+        node = _select_one(root, selector)
+        if node:
+            text = node.text(strip=True)
+            if text:
+                return text, [selector]
+=======
 SITEMAP_LOC_SELECTORS = [
     "loc",
 ]
@@ -89,6 +190,7 @@ def _text_from_selectors(soup: BeautifulSoup, selectors: Iterable[str]) -> tuple
         node = soup.select_one(selector)
         if node and node.get_text(strip=True):
             return node.get_text(strip=True), [selector]
+
     return None, []
 
 
@@ -127,6 +229,20 @@ def _resolve_url(base_url: str, href: Optional[str]) -> Optional[str]:
 
 
 def parse_product(html: str, url: str, checked_at: Optional[datetime] = None) -> Product:
+
+    root = _parse_html(html)
+    signals = ProductSignals()
+
+    title, selectors = _text_from_selectors(root, TITLE_SELECTORS)
+    signals.selectors_used.extend(selectors)
+    title = title or ""
+
+    price_text, selectors = _text_from_selectors(root, PRICE_SELECTORS)
+    signals.selectors_used.extend(selectors)
+    price_current = _extract_price(price_text)
+
+    old_price_text, selectors = _text_from_selectors(root, OLD_PRICE_SELECTORS)
+
     soup = BeautifulSoup(html, "html.parser")
     signals = ProductSignals()
 
@@ -144,6 +260,15 @@ def parse_product(html: str, url: str, checked_at: Optional[datetime] = None) ->
 
     image_url = None
     for selector in IMAGE_SELECTORS:
+
+        node = _select_one(root, selector)
+        if node and node.attrs.get("src"):
+            image_url = _resolve_url(url, node.attrs.get("src"))
+            signals.selectors_used.append(selector)
+            break
+
+    body_text = root.text(separator=" ", strip=True)
+
         node = soup.select_one(selector)
         if node and node.get("src"):
             image_url = _resolve_url(url, node.get("src"))
@@ -151,16 +276,26 @@ def parse_product(html: str, url: str, checked_at: Optional[datetime] = None) ->
             break
 
     body_text = soup.get_text(separator=" ", strip=True)
+
     signals.in_stock_hits = _has_keyword(body_text, IN_STOCK_KEYWORDS)
     signals.out_of_stock_hits = _has_keyword(body_text, OUT_OF_STOCK_KEYWORDS)
     signals.preorder_hits = _has_keyword(body_text, PREORDER_KEYWORDS)
 
     for selector in BUY_BUTTON_SELECTORS:
+
+        button = _select_one(root, selector)
+        if button:
+            signals.buy_button_found = True
+            signals.selectors_used.append(selector)
+            classes = button.attrs.get("class", "").split()
+            if "disabled" in button.attrs or "disabled" in classes:
+
         button = soup.select_one(selector)
         if button:
             signals.buy_button_found = True
             signals.selectors_used.append(selector)
             if button.has_attr("disabled") or "disabled" in button.get("class", []):
+
                 signals.buy_button_disabled = True
             break
 
@@ -190,46 +325,50 @@ def parse_product(html: str, url: str, checked_at: Optional[datetime] = None) ->
 
 
 def parse_search_results(html: str, base_url: str, limit: int = 10) -> list[SearchResult]:
-    soup = BeautifulSoup(html, "html.parser")
+    root = _parse_html(html)
     results: list[SearchResult] = []
 
-    items = []
+    items: list[HtmlNode] = []
     for selector in SEARCH_ITEM_SELECTORS:
-        items = soup.select(selector)
+        items = _select_all(root, selector)
         if items:
             break
 
     for item in items:
-        link = item.find("a", href=True)
-        url = _resolve_url(base_url, link.get("href") if link else None) or base_url
+        link = _select_one(item, "a")
+        url = _resolve_url(base_url, link.attrs.get("href") if link else None) or base_url
 
         title = None
         for selector in SEARCH_TITLE_SELECTORS:
-            node = item.select_one(selector)
-            if node and node.get_text(strip=True):
-                title = node.get_text(strip=True)
-                break
+            node = _select_one(item, selector)
+            if node:
+                text = node.text(strip=True)
+                if text:
+                    title = text
+                    break
         if not title and link:
-            title = link.get_text(strip=True)
+            title = link.text(strip=True)
         title = title or ""
 
         price_text = None
         for selector in SEARCH_PRICE_SELECTORS:
-            node = item.select_one(selector)
-            if node and node.get_text(strip=True):
-                price_text = node.get_text(strip=True)
-                break
+            node = _select_one(item, selector)
+            if node:
+                text = node.text(strip=True)
+                if text:
+                    price_text = text
+                    break
         price_current = _extract_price(price_text)
 
         image_url = None
         for selector in SEARCH_IMAGE_SELECTORS:
-            node = item.select_one(selector)
-            if node and node.get("src"):
-                image_url = _resolve_url(base_url, node.get("src"))
+            node = _select_one(item, selector)
+            if node and node.attrs.get("src"):
+                image_url = _resolve_url(base_url, node.attrs.get("src"))
                 break
 
         availability = AvailabilityStatus.UNKNOWN
-        body_text = item.get_text(separator=" ", strip=True)
+        body_text = item.text(separator=" ", strip=True)
         if _has_keyword(body_text, OUT_OF_STOCK_KEYWORDS):
             availability = AvailabilityStatus.OUT_OF_STOCK
         elif _has_keyword(body_text, IN_STOCK_KEYWORDS):
@@ -251,11 +390,12 @@ def parse_search_results(html: str, base_url: str, limit: int = 10) -> list[Sear
 
 
 def parse_sitemap_urls(xml: str) -> list[str]:
-    soup = BeautifulSoup(xml, "xml")
-    urls = []
-    for selector in SITEMAP_LOC_SELECTORS:
-        for node in soup.select(selector):
-            text = node.get_text(strip=True)
-            if text:
-                urls.append(text)
+    urls: list[str] = []
+    try:
+        root = ElementTree.fromstring(xml)
+    except ElementTree.ParseError:
+        return urls
+    for loc in root.iter():
+        if loc.tag.endswith("loc") and loc.text:
+            urls.append(loc.text.strip())
     return urls
